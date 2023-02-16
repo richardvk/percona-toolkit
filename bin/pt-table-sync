@@ -1905,6 +1905,7 @@ sub quote_val {
    my ( $self, $val, %args ) = @_;
 
    return 'NULL' unless defined $val;          # undef = NULL
+   return "DEFAULT" if $args{is_generated};
    return "''" if $val eq '';                  # blank string = ''
    return $val if $val =~ m/^0x[0-9a-fA-F]+$/  # quote hex data
                   && !$args{is_char};          # unless is_char is true
@@ -3599,6 +3600,7 @@ sub make_UPDATE {
                   $row->{$_},
                   is_char  => $is_char && !$is_hex,
                   is_float => $is_float,
+                  is_generated => defined $self->{tbl_struct}{is_generated}{$_},
             );
          } grep { !$in_where{$_} } @cols)
       . " WHERE $where LIMIT 1";
@@ -3648,6 +3650,7 @@ sub make_row {
                      $row->{$_},
                      is_char  => $is_char && !$is_hex,
                      is_float => $is_float,
+                     is_generated => defined $self->{tbl_struct}{is_generated}{$_},
                )
             } @cols)
       . ')';
