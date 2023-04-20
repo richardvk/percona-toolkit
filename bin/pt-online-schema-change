@@ -56,7 +56,7 @@ BEGIN {
 {
 package Percona::Toolkit;
 
-our $VERSION = '3.5.1';
+our $VERSION = '3.5.2';
 
 use strict;
 use warnings FATAL => 'all';
@@ -3102,7 +3102,7 @@ sub generate_cmp_where {
             push @clause, "($val IS NULL OR $quo $type $val)";
          }
          elsif ( $type =~ m/>/ ) {
-            push @clause, "($val IS NULL AND $quo IS NOT NULL) OR ($quo $cmp $val)";
+            push @clause, "(($val IS NULL AND $quo IS NOT NULL) OR ($quo $cmp $val))";
          }
          else { # If $type =~ m/</ ) {
             push @clauses, "(($val IS NOT NULL AND $quo IS NULL) OR ($quo $cmp $val))";
@@ -3328,7 +3328,7 @@ sub parse {
 
    my $engine = $self->get_engine($ddl);
 
-   my @defs   = $ddl =~ m/^(\s+`.*?),?$/gm;
+   my @defs = $ddl =~ m/(?:(?<=,\n)|(?<=\(\n))(\s+`(?:.|\n)+?`.+?),?\n/g;
    my @cols   = map { $_ =~ m/`([^`]+)`/ } @defs;
    PTDEBUG && _d('Table cols:', join(', ', map { "`$_`" } @cols));
 
@@ -3509,8 +3509,7 @@ sub get_keys {
    my $clustered_key = undef;
 
    KEY:
-   foreach my $key ( $ddl =~ m/^  ((?:[A-Z]+ )?KEY .*)$/gm ) {
-
+   foreach my $key ( $ddl =~ m/^  ((?:[A-Z]+ )?KEY [\s\S]*?\),?.*)$/gm ) {
       next KEY if $key =~ m/FOREIGN/;
 
       my $key_ddl = $key;
@@ -3520,7 +3519,7 @@ sub get_keys {
          $key =~ s/USING HASH/USING BTREE/;
       }
 
-      my ( $type, $cols ) = $key =~ m/(?:USING (\w+))? \((.+)\)/;
+      my ( $type, $cols ) = $key =~ m/(?:USING (\w+))? \(([\s\S]+)\)/;
       my ( $special ) = $key =~ m/(FULLTEXT|SPATIAL)/;
       $type = $type || $special || 'BTREE';
       my ($name) = $key =~ m/(PRIMARY|`[^`]*`)/;
@@ -3955,7 +3954,7 @@ sub connect {
    my $dp  = $self->{DSNParser};
 
    my $dbh = $self->{dbh};
-   if ( !$dbh || !$dbh->ping() ) {
+   if ( !$dbh || ( $dbh && $self->{dbh_set} && !$self->_ping($dbh) ) ) {
       if ( $self->{ask_pass} && !$self->{asked_for_pass} && !defined $dsn->{p} ) {
          $dsn->{p} = OptionParser::prompt_noecho("Enter MySQL password: ");
          $self->{asked_for_pass} = 1;
@@ -3984,19 +3983,20 @@ sub connect {
 sub set_dbh {
    my ($self, $dbh) = @_;
 
-   if ( $self->{dbh} && $self->{dbh} == $dbh && $self->{dbh_set} ) {
-      PTDEBUG && _d($dbh, 'Already set dbh');
-      return $dbh;
-   }
-
    PTDEBUG && _d($dbh, 'Setting dbh');
 
    $dbh->{FetchHashKeyName} = 'NAME_lc' if $self->{NAME_lc};
 
-   my $sql = 'SELECT @@server_id /*!50038 , @@hostname*/';
+   my $sql = 'SELECT @@server_id /*!50038 , @@hostname*/, CONNECTION_ID() as connection_id';
    PTDEBUG && _d($dbh, $sql);
-   my ($server_id, $hostname) = $dbh->selectrow_array($sql);
+   my ($server_id, $hostname, $connection_id) = $dbh->selectrow_array($sql);
    PTDEBUG && _d($dbh, 'hostname:', $hostname, $server_id);
+
+   if ( $self->{dbh} && $self->{dbh} == $dbh && $self->{dbh_set} && $self->{dbh_set} == $connection_id) {
+      PTDEBUG && _d($dbh, 'Already set dbh');
+      return $dbh;
+   }
+
    if ( $hostname ) {
       $self->{hostname} = $hostname;
    }
@@ -4011,7 +4011,7 @@ sub set_dbh {
    }
 
    $self->{dbh}     = $dbh;
-   $self->{dbh_set} = 1;
+   $self->{dbh_set} = $connection_id;
    return $dbh;
 }
 
@@ -4137,6 +4137,17 @@ sub DESTROY {
    return;
 }
 
+sub _ping() {
+   my ( $self, $dbh ) = @_;
+   if (!$dbh->ping()) {
+      return 0;
+   }
+   my $sql = 'SELECT CONNECTION_ID() as connection_id';
+   PTDEBUG && _d($dbh, $sql);
+   my ($connection_id) = $dbh->selectrow_array($sql);
+   return $self->{dbh_set} == $connection_id;
+}
+
 sub _d {
    my ($package, undef, $line) = caller 0;
    @_ = map { (my $temp = $_) =~ s/\n/\n# /g; $temp; }
@@ -4225,6 +4236,7 @@ sub get_slaves {
             dsn            => $dsn,
             slave_user     => $o->got('slave-user') ? $o->get('slave-user') : '',
             slave_password => $o->got('slave-password') ? $o->get('slave-password') : '',
+            slaves         => $args{slaves},
             callback  => sub {
                my ( $dsn, $dbh, $level, $parent ) = @_;
                return unless $level;
@@ -4301,16 +4313,29 @@ sub recurse_to_slaves {
       PTDEBUG && _d("Slave password set");
    }
 
-   my $dbh;
-   eval {
-      $dbh = $args->{dbh} || $dp->get_dbh(
-         $dp->get_cxn_params($slave_dsn), { AutoCommit => 1 });
-      PTDEBUG && _d('Connected to', $dp->as_string($slave_dsn));
-   };
-   if ( $EVAL_ERROR ) {
-      print STDERR "Cannot connect to ", $dp->as_string($slave_dsn), "\n"
-         or die "Cannot print: $OS_ERROR";
-      return;
+   my $dbh = $args->{dbh};
+   
+   DBH: {
+      if ( !defined $dbh ) {
+         foreach my $known_slave ( @{$args->{slaves}} ) {
+            if ($known_slave->{dsn}->{h} eq $slave_dsn->{h} and
+                $known_slave->{dsn}->{P} eq $slave_dsn->{P} ) {
+               $dbh = $known_slave->{dbh};
+               last DBH;
+            }
+         }
+
+         eval {
+            $dbh = $dp->get_dbh(
+               $dp->get_cxn_params($slave_dsn), { AutoCommit => 1 });
+            PTDEBUG && _d('Connected to', $dp->as_string($slave_dsn));
+         };
+         if ( $EVAL_ERROR ) {
+            print STDERR "Cannot connect to ", $dp->as_string($slave_dsn), ": ", $EVAL_ERROR, "\n"
+               or die "Cannot print: $OS_ERROR";
+            return;
+         }
+      }
    }
 
    my $sql  = 'SELECT @@SERVER_ID';
@@ -8825,6 +8850,7 @@ sub main {
          my $slaves =$ms->get_slaves(
                dbh      => $cxn->dbh(),
                dsn      => $cxn->dsn(),
+			   slaves   => $slaves,
                make_cxn => sub {
                   return $make_cxn->(
                      @_,
@@ -12342,7 +12368,7 @@ the tool to run EXPLAIN before running queries that are meant to access
 a small amount of data, but which could access many rows if MySQL chooses a bad
 execution plan. These include the queries to determine chunk boundaries and the
 chunk queries themselves. If it appears that MySQL will use a bad query
-execution plan, the tool will skip the chunk of the table.
+execution plan, the tool will stop copying rows and die.
 
 The tool uses several heuristics to determine whether an execution plan is bad.
 The first is whether EXPLAIN reports that MySQL intends to use the desired index
@@ -12351,14 +12377,8 @@ query unsafe.
 
 The tool also checks how much of the index MySQL reports that it will use for
 the query. The EXPLAIN output shows this in the key_len column. The tool
-remembers the largest key_len seen, and skips chunks where MySQL reports that it
-will use a smaller prefix of the index. This heuristic can be understood as
-skipping chunks that have a worse execution plan than other chunks.
-
-The tool prints a warning the first time a chunk is skipped due to
-a bad execution plan in each table. Subsequent chunks are skipped silently,
-although you can see the count of skipped chunks in the SKIPPED column in
-the tool's output.
+remembers the largest key_len seen, and terminates if MySQL reports that it
+will use a smaller prefix of the index.
 
 This option adds some setup work to each table and chunk. Although the work is
 not intrusive for MySQL, it results in more round-trips to the server, which
@@ -12429,13 +12449,6 @@ point, but after that, the tool ignores this option's value.  If you set this
 option explicitly, however, then it disables the dynamic adjustment behavior and
 tries to make all chunks exactly the specified number of rows.
 
-There is a subtlety: if the chunk index is not unique, then it's possible that
-chunks will be larger than desired. For example, if a table is chunked by an
-index that contains 10,000 of a given value, there is no way to write a WHERE
-clause that matches only 1,000 of the values, and that chunk will be at least
-10,000 rows large.  Such a chunk will probably be skipped because of
-L<"--chunk-size-limit">.
-
 =item --chunk-size-limit
 
 type: float; default: 4.0
@@ -12445,7 +12458,7 @@ Do not copy chunks this much larger than the desired chunk size.
 When a table has no unique indexes, chunk sizes can be inaccurate.  This option
 specifies a maximum tolerable limit to the inaccuracy.  The tool uses <EXPLAIN>
 to estimate how many rows are in the chunk.  If that estimate exceeds the
-desired chunk size times the limit, then the tool skips the chunk.
+desired chunk size times the limit, then the tool will stop copying rows and die.
 
 The minimum value for this option is 1, which means that no chunk can be larger
 than L<"--chunk-size">.  You probably don't want to specify 1, because rows
@@ -13467,6 +13480,6 @@ Place, Suite 330, Boston, MA  02111-1307  USA.
 
 =head1 VERSION
 
-pt-online-schema-change 3.5.1
+pt-online-schema-change 3.5.2
 
 =cut

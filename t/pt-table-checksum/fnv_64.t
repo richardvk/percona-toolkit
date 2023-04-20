@@ -37,8 +37,6 @@ $sb->create_dbs($master_dbh, [qw(test)]);
 eval { $master_dbh->do('DROP FUNCTION IF EXISTS fnv_64'); };
 eval { $master_dbh->do("CREATE FUNCTION fnv_64 RETURNS INTEGER SONAME 'libfnv_udf.so';"); };
 if ( $EVAL_ERROR ) {
-#REMOVEME
-print  $EVAL_ERROR;
    chomp $EVAL_ERROR;
    plan skip_all => "No FNV_64 UDF lib"
 }
@@ -109,6 +107,7 @@ is(
 # #############################################################################
 # Done.
 # #############################################################################
+$master_dbh->do('DROP FUNCTION IF EXISTS fnv_64');
 $sb->wipe_clean($master_dbh);
 ok($sb->ok(), "Sandbox servers") or BAIL_OUT(__FILE__ . " broke the sandbox");
 exit;
