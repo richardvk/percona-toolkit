@@ -3864,7 +3864,8 @@ sub calculate_chunks {
    foreach my $arg ( @required_args ) {
       die "I need a $arg argument" unless defined $args{$arg};
    }
-   PTDEBUG && _d('Calculate chunks for',
+   #rvk - this here so it comes out of the Go program too
+   1 && _d('Calculate chunks for',
       join(", ", map {"$_=".(defined $args{$_} ? $args{$_} : "undef")}
          qw(db tbl chunk_col min max rows_in_range chunk_size zero_chunk exact)
       ));
@@ -3878,6 +3879,10 @@ sub calculate_chunks {
       PTDEBUG && _d("Chunk size larger than rows in range");
       return '1=1';
    }
+#rvk
+	 else {
+	    PTDEBUG && _d("Chunk size SMALLER THAN rows in range");
+	 }
 
    my $q          = $self->{Quoter};
    my $dbh        = $args{dbh};
@@ -4029,6 +4034,7 @@ sub _chunk_numeric {
    }
    PTDEBUG && _d("Using chunk range:", $start_point, "to", $end_point);
 
+#rvk
    my $interval = $args{chunk_size}
                 * ($end_point - $start_point)
                 / $args{rows_in_range};
@@ -4311,16 +4317,32 @@ sub get_range_statistics {
          . "on column $col: $EVAL_ERROR";
    }
 
-   my $sql = "EXPLAIN SELECT * FROM $db_tbl"
+#rvkk
+   my $rows_in_range;
+	 PTDEBUG && _d("rvk: force_row_count: ", $args{force_row_count});
+
+	 if (!defined $args{force_row_count}) {
+       my $sql = "EXPLAIN SELECT * FROM $db_tbl"
            . ($args{index_hint} ? " $args{index_hint}" : "")
            . ($where ? " WHERE $where" : '');
-   PTDEBUG && _d($sql);
-   my $expl = $dbh->selectrow_hashref($sql);
+       PTDEBUG && _d($sql);
+       my $expl = $dbh->selectrow_hashref($sql);
+       $rows_in_range = $expl->{rows};
+	 }
+	 else {
+      my $sql = "SELECT COUNT(*) AS rowcount FROM $db_tbl"
+           . ($where ? " WHERE $where" : '');
+       PTDEBUG && _d($sql);
+       my $expl = $dbh->selectrow_hashref($sql);
+       $rows_in_range = $expl->{rowcount};
+	}
 
    return (
       min           => $min,
       max           => $max,
-      rows_in_range => $expl->{rows},
+#rvk
+      #rows_in_range => $expl->{rows},
+      rows_in_range => $rows_in_range,
    );
 }
 
@@ -5178,6 +5200,7 @@ sub prepare_to_sync {
 
    my @chunks;
    my %range_params = $chunker->get_range_statistics(%args);
+#rvk
    if ( !grep { !defined $range_params{$_} } qw(min max rows_in_range) ) {
       ($args{chunk_size}) = $chunker->size_to_rows(%args);
       @chunks = $chunker->calculate_chunks(%args, %range_params);
@@ -5188,6 +5211,8 @@ sub prepare_to_sync {
    }
 
    $self->{chunks}    = \@chunks;
+   # rvk - so this gets shown by Go program
+	 1 && _d("Number of chunks: ", scalar(@chunks));
    $self->{chunk_num} = 0;
    $self->{state}     = 0;
 
@@ -6796,7 +6821,7 @@ sub recurse_to_slaves {
    }
 
    my $dbh = $args->{dbh};
-   
+
    DBH: {
       if ( !defined $dbh ) {
          foreach my $known_slave ( @{$args->{slaves}} ) {
@@ -10914,6 +10939,7 @@ sub sync_a_table {
          trim              => $o->get('trim'),
          wait              => $o->get('wait'),
          function          => $o->get('function'),
+         force_row_count   => $o->get('force-row-count'),
          trace             => !$ENV{PT_TEST_NO_TRACE},
       );
 
@@ -12533,6 +12559,10 @@ values on different MySQL versions and hardware.  The default is no rounding;
 the values are converted to strings by the CONCAT() function, and MySQL chooses
 the string representation.  If you specify a value of 2, for example, then the
 values 1.008 and 1.009 will be rounded to 1.01, and will checksum as equal.
+
+=item --force-row-count
+
+Richard says use SELECT COUNT(*) rather than EXPLAIN
 
 =item --[no]foreign-key-checks
 
